@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../lib/supabase';
 import { Project, Task, Milestone } from '../types';
 import { Plus, Save, Trash2, CheckSquare } from 'lucide-react';
@@ -11,6 +11,7 @@ export default function ProjectTasksPage() {
   const [showMilestoneModal, setShowMilestoneModal] = useState(false);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [milestoneTasks, setMilestoneTasks] = useState<Map<string, string[]>>(new Map()); // milestone_id -> task_ids[]
+  const updateTimeouts = useRef<Map<string, NodeJS.Timeout>>(new Map()); // Track debounce timeouts per task field
 
   const [projectForm, setProjectForm] = useState({
     name: '',
@@ -154,7 +155,7 @@ export default function ProjectTasksPage() {
 
     const newTask = {
       project_id: selectedProject.id,
-      name: `Task ${tasks.length + 1}`,
+      name: '', // Empty name instead of "Task X"
       planned_start_date: null,
       planned_end_date: null,
       actual_start_date: null,
@@ -242,55 +243,70 @@ export default function ProjectTasksPage() {
   };
 
   const updateTask = async (taskId: string, field: string, value: string) => {
-    // Use functional update to ensure we always have the latest state (prevents race conditions)
+    // Update local state immediately for responsive UI
     setTasks(prevTasks => {
-      const updatedTasks = prevTasks.map(t => t.id === taskId ? { ...t, [field]: value || null } : t);
-      
-      // Update database asynchronously (fire and forget for better UX)
-      supabase
-        .from('tasks')
-        .update({ [field]: value || null })
-        .eq('id', taskId)
-        .then(({ error }) => {
-          if (error) {
-            console.error('Error updating task:', error);
-            // Reload tasks on error to sync with database
-            if (selectedProject) {
-              loadTasks(selectedProject.id);
-            }
-          } else {
-            // Update milestone dates if this task belongs to a milestone
-            const milestoneId = Array.from(milestoneTasks.entries()).find(([_, taskIds]) => taskIds.includes(taskId))?.[0];
-            if (milestoneId) {
-              // Use current state to calculate dates
-              setTasks(currentTasks => {
-                const dates = calculateMilestoneDatesWithTasks(milestoneId, currentTasks);
-                
-                // Update milestone in database
-                supabase
-                  .from('milestones')
-                  .update({
-                    planned_start_date: dates.planned_start,
-                    planned_end_date: dates.planned_end,
-                    actual_start_date: dates.actual_start,
-                    actual_end_date: dates.actual_end,
-                  })
-                  .eq('id', milestoneId)
-                  .then(() => {
-                    // Refresh milestones
-                    if (selectedProject) {
-                      loadMilestones(selectedProject.id);
-                    }
-                  });
-                
-                return currentTasks; // Don't modify state here
-              });
-            }
-          }
-        });
-      
-      return updatedTasks;
+      return prevTasks.map(t => t.id === taskId ? { ...t, [field]: value || null } : t);
     });
+    
+    // Clear existing timeout for this task+field combination
+    const timeoutKey = `${taskId}-${field}`;
+    const existingTimeout = updateTimeouts.current.get(timeoutKey);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+    
+    // Debounce database updates for text fields (name) to prevent too many calls
+    const isTextField = field === 'name';
+    const debounceDelay = isTextField ? 500 : 0; // 500ms debounce for text, immediate for dates
+    
+    const timeout = setTimeout(async () => {
+      updateTimeouts.current.delete(timeoutKey);
+      
+      try {
+        const { error } = await supabase
+          .from('tasks')
+          .update({ [field]: value || null })
+          .eq('id', taskId);
+
+        if (error) {
+          console.error('Error updating task:', error);
+          // Don't reload on error - it resets the input. Just log it.
+          // The user can manually refresh if needed
+        } else {
+          // Update milestone dates if this task belongs to a milestone
+          const milestoneId = Array.from(milestoneTasks.entries()).find(([_, taskIds]) => taskIds.includes(taskId))?.[0];
+          if (milestoneId) {
+            // Get current tasks state to calculate dates
+            setTasks(currentTasks => {
+              const dates = calculateMilestoneDatesWithTasks(milestoneId, currentTasks);
+              
+              // Update milestone in database (async, don't wait)
+              supabase
+                .from('milestones')
+                .update({
+                  planned_start_date: dates.planned_start,
+                  planned_end_date: dates.planned_end,
+                  actual_start_date: dates.actual_start,
+                  actual_end_date: dates.actual_end,
+                })
+                .eq('id', milestoneId)
+                .then(() => {
+                  // Refresh milestones
+                  if (selectedProject) {
+                    loadMilestones(selectedProject.id);
+                  }
+                });
+              
+              return currentTasks; // Don't modify state here
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Error updating task:', err);
+      }
+    }, debounceDelay);
+    
+    updateTimeouts.current.set(timeoutKey, timeout);
   };
 
   const deleteTask = async (taskId: string) => {
