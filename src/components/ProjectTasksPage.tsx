@@ -78,7 +78,11 @@ export default function ProjectTasksPage() {
     if (error) {
       console.error('Error loading milestones:', error);
     } else if (data) {
-      setMilestones(data);
+      // Deduplicate milestones by id (in case of duplicate loads)
+      const uniqueMilestones = Array.from(
+        new Map(data.map(m => [m.id, m])).values()
+      );
+      setMilestones(uniqueMilestones);
     }
   };
 
@@ -237,17 +241,27 @@ export default function ProjectTasksPage() {
     return { planned_start, planned_end, actual_start, actual_end };
   };
 
+  // Track pending updates to prevent race conditions
   const updateTask = async (taskId: string, field: string, value: string) => {
-    const { error } = await supabase
-      .from('tasks')
-      .update({ [field]: value || null })
-      .eq('id', taskId);
+    // Update local state immediately for better UX (especially for text inputs)
+    const updatedTasks = tasks.map(t => t.id === taskId ? { ...t, [field]: value || null } : t);
+    setTasks(updatedTasks);
+    
+    // Update database asynchronously
+    try {
+      const { error } = await supabase
+        .from('tasks')
+        .update({ [field]: value || null })
+        .eq('id', taskId);
 
-    if (error) {
-      console.error('Error updating task:', error);
-    } else {
-      const updatedTasks = tasks.map(t => t.id === taskId ? { ...t, [field]: value || null } : t);
-      setTasks(updatedTasks);
+      if (error) {
+        console.error('Error updating task:', error);
+        // Reload tasks on error to sync with database
+        if (selectedProject) {
+          loadTasks(selectedProject.id);
+        }
+        return;
+      }
       
       // Update milestone dates if this task belongs to a milestone
       const milestoneId = Array.from(milestoneTasks.entries()).find(([_, taskIds]) => taskIds.includes(taskId))?.[0];
@@ -268,6 +282,12 @@ export default function ProjectTasksPage() {
         if (selectedProject) {
           loadMilestones(selectedProject.id);
         }
+      }
+    } catch (err) {
+      console.error('Error updating task:', err);
+      // Reload tasks on error to sync with database
+      if (selectedProject) {
+        loadTasks(selectedProject.id);
       }
     }
   };
@@ -300,6 +320,28 @@ export default function ProjectTasksPage() {
       newSelection.add(taskId);
     }
     setSelectedTasks(newSelection);
+  };
+
+  const deleteMilestone = async (milestoneId: string) => {
+    if (!confirm('Are you sure you want to delete this milestone? The tasks will remain but will be unassigned.')) {
+      return;
+    }
+
+    const { error } = await supabase
+      .from('milestones')
+      .delete()
+      .eq('id', milestoneId);
+
+    if (error) {
+      console.error('Error deleting milestone:', error);
+      alert('Error deleting milestone');
+    } else {
+      // Reload milestones and milestone tasks
+      if (selectedProject) {
+        await loadMilestones(selectedProject.id);
+        await loadMilestoneTasks(selectedProject.id);
+      }
+    }
   };
 
   const createMilestone = async () => {
@@ -499,9 +541,14 @@ export default function ProjectTasksPage() {
 
                     // Build rows: milestone rows + their tasks
                     const rows: JSX.Element[] = [];
+                    
+                    // Deduplicate milestones by id before rendering (safety check)
+                    const uniqueMilestonesMap = new Map<string, Milestone>();
+                    milestones.forEach(m => uniqueMilestonesMap.set(m.id, m));
+                    const uniqueMilestones = Array.from(uniqueMilestonesMap.values());
 
                     // Add milestone rows with their tasks
-                    milestones.forEach((milestone) => {
+                    uniqueMilestones.forEach((milestone) => {
                       const milestoneTaskIds = milestoneTasks.get(milestone.id) || [];
                       const milestoneTaskList = tasks.filter((t) => milestoneTaskIds.includes(t.id));
                       
@@ -528,7 +575,15 @@ export default function ProjectTasksPage() {
                               {milestoneStatus}
                             </span>
                           </td>
-                          <td className="py-3 px-4"></td>
+                          <td className="py-3 px-4">
+                            <button
+                              onClick={() => deleteMilestone(milestone.id)}
+                              className="text-red-600 hover:text-red-800 transition"
+                              title="Delete Milestone"
+                            >
+                              <Trash2 size={18} />
+                            </button>
+                          </td>
                         </tr>
                       );
 
