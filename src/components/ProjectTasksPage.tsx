@@ -241,55 +241,56 @@ export default function ProjectTasksPage() {
     return { planned_start, planned_end, actual_start, actual_end };
   };
 
-  // Track pending updates to prevent race conditions
   const updateTask = async (taskId: string, field: string, value: string) => {
-    // Update local state immediately for better UX (especially for text inputs)
-    const updatedTasks = tasks.map(t => t.id === taskId ? { ...t, [field]: value || null } : t);
-    setTasks(updatedTasks);
-    
-    // Update database asynchronously
-    try {
-      const { error } = await supabase
+    // Use functional update to ensure we always have the latest state (prevents race conditions)
+    setTasks(prevTasks => {
+      const updatedTasks = prevTasks.map(t => t.id === taskId ? { ...t, [field]: value || null } : t);
+      
+      // Update database asynchronously (fire and forget for better UX)
+      supabase
         .from('tasks')
         .update({ [field]: value || null })
-        .eq('id', taskId);
-
-      if (error) {
-        console.error('Error updating task:', error);
-        // Reload tasks on error to sync with database
-        if (selectedProject) {
-          loadTasks(selectedProject.id);
-        }
-        return;
-      }
+        .eq('id', taskId)
+        .then(({ error }) => {
+          if (error) {
+            console.error('Error updating task:', error);
+            // Reload tasks on error to sync with database
+            if (selectedProject) {
+              loadTasks(selectedProject.id);
+            }
+          } else {
+            // Update milestone dates if this task belongs to a milestone
+            const milestoneId = Array.from(milestoneTasks.entries()).find(([_, taskIds]) => taskIds.includes(taskId))?.[0];
+            if (milestoneId) {
+              // Use current state to calculate dates
+              setTasks(currentTasks => {
+                const dates = calculateMilestoneDatesWithTasks(milestoneId, currentTasks);
+                
+                // Update milestone in database
+                supabase
+                  .from('milestones')
+                  .update({
+                    planned_start_date: dates.planned_start,
+                    planned_end_date: dates.planned_end,
+                    actual_start_date: dates.actual_start,
+                    actual_end_date: dates.actual_end,
+                  })
+                  .eq('id', milestoneId)
+                  .then(() => {
+                    // Refresh milestones
+                    if (selectedProject) {
+                      loadMilestones(selectedProject.id);
+                    }
+                  });
+                
+                return currentTasks; // Don't modify state here
+              });
+            }
+          }
+        });
       
-      // Update milestone dates if this task belongs to a milestone
-      const milestoneId = Array.from(milestoneTasks.entries()).find(([_, taskIds]) => taskIds.includes(taskId))?.[0];
-      if (milestoneId) {
-        const dates = calculateMilestoneDatesWithTasks(milestoneId, updatedTasks);
-        // Update milestone in database (though we'll recalculate on display, this keeps DB in sync)
-        await supabase
-          .from('milestones')
-          .update({
-            planned_start_date: dates.planned_start,
-            planned_end_date: dates.planned_end,
-            actual_start_date: dates.actual_start,
-            actual_end_date: dates.actual_end,
-          })
-          .eq('id', milestoneId);
-        
-        // Refresh milestones
-        if (selectedProject) {
-          loadMilestones(selectedProject.id);
-        }
-      }
-    } catch (err) {
-      console.error('Error updating task:', err);
-      // Reload tasks on error to sync with database
-      if (selectedProject) {
-        loadTasks(selectedProject.id);
-      }
-    }
+      return updatedTasks;
+    });
   };
 
   const deleteTask = async (taskId: string) => {
