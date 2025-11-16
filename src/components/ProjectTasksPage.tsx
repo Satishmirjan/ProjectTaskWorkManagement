@@ -167,13 +167,36 @@ export default function ProjectTasksPage() {
       console.error('Error adding task:', error);
     } else if (data) {
       setTasks([...tasks, data]);
+      // Reload milestone tasks to ensure consistency
+      if (selectedProject) {
+        loadMilestoneTasks(selectedProject.id);
+      }
     }
   };
 
-  // Calculate milestone dates from its tasks
+  // Calculate milestone dates from its tasks (uses current tasks state)
   const calculateMilestoneDates = (milestoneId: string): { planned_start: string | null; planned_end: string | null; actual_start: string | null; actual_end: string | null } => {
+    return calculateMilestoneDatesWithTasks(milestoneId, tasks);
+  };
+
+  // Compute status based on dates
+  const computeStatus = (plannedStart: string | null, plannedEnd: string | null, actualStart: string | null, actualEnd: string | null): string => {
+    if (actualEnd) {
+      return 'Completed';
+    }
+    if (actualStart) {
+      return 'In Progress';
+    }
+    if (plannedStart && new Date(plannedStart) <= new Date()) {
+      return 'Started';
+    }
+    return 'Not Started';
+  };
+
+  // Helper to calculate milestone dates with a specific task list
+  const calculateMilestoneDatesWithTasks = (milestoneId: string, taskList: Task[]): { planned_start: string | null; planned_end: string | null; actual_start: string | null; actual_end: string | null } => {
     const taskIds = milestoneTasks.get(milestoneId) || [];
-    const milestoneTaskList = tasks.filter(t => taskIds.includes(t.id));
+    const milestoneTaskList = taskList.filter(t => taskIds.includes(t.id));
 
     if (milestoneTaskList.length === 0) {
       return { planned_start: null, planned_end: null, actual_start: null, actual_end: null };
@@ -214,20 +237,6 @@ export default function ProjectTasksPage() {
     return { planned_start, planned_end, actual_start, actual_end };
   };
 
-  // Compute status based on dates
-  const computeStatus = (plannedStart: string | null, plannedEnd: string | null, actualStart: string | null, actualEnd: string | null): string => {
-    if (actualEnd) {
-      return 'Completed';
-    }
-    if (actualStart) {
-      return 'In Progress';
-    }
-    if (plannedStart && new Date(plannedStart) <= new Date()) {
-      return 'Started';
-    }
-    return 'Not Started';
-  };
-
   const updateTask = async (taskId: string, field: string, value: string) => {
     const { error } = await supabase
       .from('tasks')
@@ -243,7 +252,7 @@ export default function ProjectTasksPage() {
       // Update milestone dates if this task belongs to a milestone
       const milestoneId = Array.from(milestoneTasks.entries()).find(([_, taskIds]) => taskIds.includes(taskId))?.[0];
       if (milestoneId) {
-        const dates = calculateMilestoneDates(milestoneId);
+        const dates = calculateMilestoneDatesWithTasks(milestoneId, updatedTasks);
         // Update milestone in database (though we'll recalculate on display, this keeps DB in sync)
         await supabase
           .from('milestones')
@@ -275,6 +284,11 @@ export default function ProjectTasksPage() {
       setTasks(tasks.filter(t => t.id !== taskId));
       selectedTasks.delete(taskId);
       setSelectedTasks(new Set(selectedTasks));
+      // Reload milestone tasks to ensure consistency
+      if (selectedProject) {
+        loadMilestoneTasks(selectedProject.id);
+        loadMilestones(selectedProject.id);
+      }
     }
   };
 
@@ -299,11 +313,43 @@ export default function ProjectTasksPage() {
       return;
     }
 
+    // Calculate dates from selected tasks
+    const selectedTaskList = tasks.filter(t => selectedTasks.has(t.id));
+    const plannedStarts = selectedTaskList
+      .map(t => t.planned_start_date)
+      .filter((date): date is string => date !== null);
+    const plannedEnds = selectedTaskList
+      .map(t => t.planned_end_date)
+      .filter((date): date is string => date !== null);
+    const actualStarts = selectedTaskList
+      .map(t => t.actual_start_date)
+      .filter((date): date is string => date !== null);
+    const actualEnds = selectedTaskList
+      .map(t => t.actual_end_date)
+      .filter((date): date is string => date !== null);
+
+    const planned_start_date = plannedStarts.length > 0 
+      ? plannedStarts.reduce((earliest, current) => current < earliest ? current : earliest)
+      : null;
+    const planned_end_date = plannedEnds.length > 0
+      ? plannedEnds.reduce((latest, current) => current > latest ? current : latest)
+      : null;
+    const actual_start_date = actualStarts.length > 0
+      ? actualStarts.reduce((earliest, current) => current < earliest ? current : earliest)
+      : null;
+    const actual_end_date = actualEnds.length > 0
+      ? actualEnds.reduce((latest, current) => current > latest ? current : latest)
+      : null;
+
     const { data: milestone, error: milestoneError } = await supabase
       .from('milestones')
       .insert([{
         project_id: selectedProject.id,
-        ...milestoneForm,
+        name: milestoneForm.name,
+        planned_start_date,
+        planned_end_date,
+        actual_start_date,
+        actual_end_date,
       }])
       .select()
       .single();
@@ -313,19 +359,23 @@ export default function ProjectTasksPage() {
       return;
     }
 
-    const milestoneTasks = Array.from(selectedTasks).map(taskId => ({
+    const milestoneTaskRelations = Array.from(selectedTasks).map(taskId => ({
       milestone_id: milestone.id,
       task_id: taskId,
     }));
 
     const { error: linkError } = await supabase
       .from('milestone_tasks')
-      .insert(milestoneTasks);
+      .insert(milestoneTaskRelations);
 
     if (linkError) {
       console.error('Error linking tasks to milestone:', linkError);
     } else {
-      setMilestones([...milestones, milestone]);
+      // Reload milestone tasks to ensure consistency
+      if (selectedProject) {
+        await loadMilestoneTasks(selectedProject.id);
+        await loadMilestones(selectedProject.id);
+      }
       setShowMilestoneModal(false);
       setMilestoneForm({
         name: '',
@@ -427,16 +477,156 @@ export default function ProjectTasksPage() {
                 <thead>
                   <tr className="border-b-2 border-slate-200">
                     <th className="py-3 px-4 text-left text-slate-600 font-semibold">Select</th>
-                    <th className="py-3 px-4 text-left text-slate-600 font-semibold">Task Name</th>
+                    <th className="py-3 px-4 text-left text-slate-600 font-semibold">Name</th>
                     <th className="py-3 px-4 text-left text-slate-600 font-semibold">Planned Start</th>
                     <th className="py-3 px-4 text-left text-slate-600 font-semibold">Planned End</th>
                     <th className="py-3 px-4 text-left text-slate-600 font-semibold">Actual Start</th>
                     <th className="py-3 px-4 text-left text-slate-600 font-semibold">Actual End</th>
+                    <th className="py-3 px-4 text-left text-slate-600 font-semibold">Status</th>
                     <th className="py-3 px-4 text-left text-slate-600 font-semibold">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {tasks.map(task => (
+                  {(() => {
+                    // Get all task IDs that belong to milestones
+                    const taskIdsInMilestones = new Set<string>();
+                    milestoneTasks.forEach((taskIds) => {
+                      taskIds.forEach((taskId) => taskIdsInMilestones.add(taskId));
+                    });
+
+                    // Get unassigned tasks
+                    const unassignedTasks = tasks.filter((t) => !taskIdsInMilestones.has(t.id));
+
+                    // Build rows: milestone rows + their tasks
+                    const rows: JSX.Element[] = [];
+
+                    // Add milestone rows with their tasks
+                    milestones.forEach((milestone) => {
+                      const milestoneTaskIds = milestoneTasks.get(milestone.id) || [];
+                      const milestoneTaskList = tasks.filter((t) => milestoneTaskIds.includes(t.id));
+                      
+                      // Calculate milestone dates from tasks
+                      const milestoneDates = calculateMilestoneDates(milestone.id);
+                      const milestoneStatus = computeStatus(
+                        milestoneDates.planned_start,
+                        milestoneDates.planned_end,
+                        milestoneDates.actual_start,
+                        milestoneDates.actual_end
+                      );
+
+                      // Add milestone row
+                      rows.push(
+                        <tr key={milestone.id} className="bg-purple-50 border-b-2 border-purple-200">
+                          <td className="py-3 px-4"></td>
+                          <td className="py-3 px-4 font-semibold text-purple-700">{milestone.name}</td>
+                          <td className="py-3 px-4 text-purple-600">{milestoneDates.planned_start || '-'}</td>
+                          <td className="py-3 px-4 text-purple-600">{milestoneDates.planned_end || '-'}</td>
+                          <td className="py-3 px-4 text-purple-600">{milestoneDates.actual_start || '-'}</td>
+                          <td className="py-3 px-4 text-purple-600">{milestoneDates.actual_end || '-'}</td>
+                          <td className="py-3 px-4">
+                            <span className="px-2 py-1 text-xs font-semibold rounded-full bg-purple-100 text-purple-700">
+                              {milestoneStatus}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4"></td>
+                        </tr>
+                      );
+
+                      // Add tasks under this milestone
+                      milestoneTaskList.forEach((task) => {
+                        const taskStatus = computeStatus(
+                          task.planned_start_date,
+                          task.planned_end_date,
+                          task.actual_start_date,
+                          task.actual_end_date
+                        );
+                        rows.push(
+                          <tr key={task.id} className="border-b border-slate-100 hover:bg-slate-50">
+                            <td className="py-3 px-4">
+                              <input
+                                type="checkbox"
+                                checked={selectedTasks.has(task.id)}
+                                onChange={() => toggleTaskSelection(task.id)}
+                                className="w-5 h-5 cursor-pointer"
+                              />
+                            </td>
+                            <td className="py-3 px-4 pl-8">
+                              <input
+                                type="text"
+                                value={task.name}
+                                onChange={(e) => updateTask(task.id, 'name', e.target.value)}
+                                className="w-full px-2 py-1 border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              />
+                            </td>
+                            <td className="py-3 px-4">
+                              <input
+                                type="date"
+                                value={task.planned_start_date || ''}
+                                onChange={(e) => updateTask(task.id, 'planned_start_date', e.target.value)}
+                                className="w-full px-2 py-1 border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              />
+                            </td>
+                            <td className="py-3 px-4">
+                              <input
+                                type="date"
+                                value={task.planned_end_date || ''}
+                                onChange={(e) => updateTask(task.id, 'planned_end_date', e.target.value)}
+                                className="w-full px-2 py-1 border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              />
+                            </td>
+                            <td className="py-3 px-4">
+                              <input
+                                type="date"
+                                value={task.actual_start_date || ''}
+                                onChange={(e) => updateTask(task.id, 'actual_start_date', e.target.value)}
+                                className="w-full px-2 py-1 border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              />
+                            </td>
+                            <td className="py-3 px-4">
+                              <input
+                                type="date"
+                                value={task.actual_end_date || ''}
+                                onChange={(e) => updateTask(task.id, 'actual_end_date', e.target.value)}
+                                className="w-full px-2 py-1 border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                              />
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="px-2 py-1 text-xs font-semibold rounded-full bg-blue-100 text-blue-700">
+                                {taskStatus}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4">
+                              <button
+                                onClick={() => deleteTask(task.id)}
+                                className="text-red-600 hover:text-red-800 transition"
+                              >
+                                <Trash2 size={18} />
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      });
+                    });
+
+                    // Add unassigned tasks section header if there are any
+                    if (unassignedTasks.length > 0) {
+                      rows.push(
+                        <tr key="unassigned-header" className="bg-slate-100 border-b-2 border-slate-300">
+                          <td className="py-3 px-4"></td>
+                          <td className="py-3 px-4 font-semibold text-slate-700" colSpan={6}>Unassigned Tasks</td>
+                          <td className="py-3 px-4"></td>
+                        </tr>
+                      );
+
+                      // Add unassigned tasks
+                      unassignedTasks.forEach((task) => {
+                        const taskStatus = computeStatus(
+                          task.planned_start_date,
+                          task.planned_end_date,
+                          task.actual_start_date,
+                          task.actual_end_date
+                        );
+                        rows.push(
                     <tr key={task.id} className="border-b border-slate-100 hover:bg-slate-50">
                       <td className="py-3 px-4">
                         <input
@@ -486,6 +676,11 @@ export default function ProjectTasksPage() {
                           className="w-full px-2 py-1 border border-slate-200 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                         />
                       </td>
+                            <td className="py-3 px-4">
+                              <span className="px-2 py-1 text-xs font-semibold rounded-full bg-blue-100 text-blue-700">
+                                {taskStatus}
+                              </span>
+                      </td>
                       <td className="py-3 px-4">
                         <button
                           onClick={() => deleteTask(task.id)}
@@ -495,40 +690,15 @@ export default function ProjectTasksPage() {
                         </button>
                       </td>
                     </tr>
-                  ))}
+                        );
+                      });
+                    }
+
+                    return rows;
+                  })()}
                 </tbody>
               </table>
             </div>
-
-            {milestones.length > 0 && (
-              <div className="mt-8">
-                <h3 className="text-xl font-semibold text-slate-700 mb-4">Milestones</h3>
-                <div className="overflow-x-auto">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="border-b-2 border-slate-200">
-                        <th className="py-3 px-4 text-left text-slate-600 font-semibold">Milestone Name</th>
-                        <th className="py-3 px-4 text-left text-slate-600 font-semibold">Planned Start</th>
-                        <th className="py-3 px-4 text-left text-slate-600 font-semibold">Planned End</th>
-                        <th className="py-3 px-4 text-left text-slate-600 font-semibold">Actual Start</th>
-                        <th className="py-3 px-4 text-left text-slate-600 font-semibold">Actual End</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {milestones.map(milestone => (
-                        <tr key={milestone.id} className="border-b border-slate-100 hover:bg-slate-50">
-                          <td className="py-3 px-4 font-medium text-purple-700">{milestone.name}</td>
-                          <td className="py-3 px-4">{milestone.planned_start_date || '-'}</td>
-                          <td className="py-3 px-4">{milestone.planned_end_date || '-'}</td>
-                          <td className="py-3 px-4">{milestone.actual_start_date || '-'}</td>
-                          <td className="py-3 px-4">{milestone.actual_end_date || '-'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -548,47 +718,16 @@ export default function ProjectTasksPage() {
                   onChange={(e) => setMilestoneForm({ ...milestoneForm, name: e.target.value })}
                 />
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-2">Planned Start Date</label>
-                  <input
-                    type="date"
-                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    value={milestoneForm.planned_start_date}
-                    onChange={(e) => setMilestoneForm({ ...milestoneForm, planned_start_date: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-2">Planned End Date</label>
-                  <input
-                    type="date"
-                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    value={milestoneForm.planned_end_date}
-                    onChange={(e) => setMilestoneForm({ ...milestoneForm, planned_end_date: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-2">Actual Start Date</label>
-                  <input
-                    type="date"
-                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    value={milestoneForm.actual_start_date}
-                    onChange={(e) => setMilestoneForm({ ...milestoneForm, actual_start_date: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-600 mb-2">Actual End Date</label>
-                  <input
-                    type="date"
-                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
-                    value={milestoneForm.actual_end_date}
-                    onChange={(e) => setMilestoneForm({ ...milestoneForm, actual_end_date: e.target.value })}
-                  />
-                </div>
-              </div>
-              <div className="bg-slate-50 p-4 rounded-lg">
-                <p className="text-sm text-slate-600">
+              <div className="bg-blue-50 border border-blue-200 p-4 rounded-lg">
+                <p className="text-sm text-blue-800 font-medium mb-2">
                   Selected Tasks: {selectedTasks.size}
+                </p>
+                <p className="text-xs text-blue-700">
+                  Milestone dates will be automatically calculated from the selected tasks:
+                  <br />• Planned Start = Earliest task planned start date
+                  <br />• Planned End = Latest task planned end date
+                  <br />• Actual Start = Earliest task actual start date
+                  <br />• Actual End = Latest task actual end date
                 </p>
               </div>
             </div>
